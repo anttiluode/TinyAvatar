@@ -40,7 +40,7 @@ runs even on CPU (the model is tiny).
 ## Try it in one minute (no training)
 
 1. Start the app, go to **Avatar Driver**.
-2. The bundled `model.pt` is auto-detected (any `.pt` next to the app or
+2. The bundled `model2.pt` is auto-detected (any `.pt` next to the app or
    under `runs/` shows up in the dropdown).
 3. Click **Latent walk** — the model surfs its own face manifold using
    phase-transport pursuit. This is the "surf that never melts" demo.
