@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# splat_trainer2.py — the fast trainer (faces folder -> better splat_decoder.onnx)
+# splat_trainer3v2.py — the fast trainer (faces folder -> better splat_decoder.onnx)
 #
 # Same architecture as splat_generator.py (latent 128, Gabor packets, anchor
 # grid, complex phase head) so every existing tool — splat_cv5, probe, surf,
@@ -249,6 +249,18 @@ class SplatVAE(nn.Module):
 def kl(mu, lv):
     return -0.5 * torch.mean(torch.sum(1 + lv - mu.pow(2) - lv.exp(), dim=1))
 
+def kl_free(mu, lv, fb):
+    """free bits: per-dim KL clamped at fb nats before summing.
+    fb=0 reduces exactly to kl(). Dims below the floor pay no penalty,
+    so beta can rise 10-50x before the collapse that low-beta training
+    hits — pushing the aggregate posterior toward the prior, which is
+    what makes prior SAMPLES diverse. Effect on THIS architecture is
+    unmeasured until you run it: watch the div readout."""
+    d = -0.5 * (1 + lv - mu.pow(2) - lv.exp())          # (B, LATENT)
+    if fb > 0:
+        d = d.clamp(min=fb)
+    return d.sum(dim=1).mean()
+
 # ======================================================================
 # 3) training — steps, resident data, bf16, cosine LR
 # ======================================================================
@@ -291,6 +303,14 @@ def train(args, dev):
     for step in range(1, args.steps + 1):
         idx = torch.randint(0, n, (args.batch,), generator=g)
         x = batch_from(data, idx, dev)
+        if args.aug:
+            flip = torch.rand(x.shape[0], device=x.device) < 0.5
+            x[flip] = torch.flip(x[flip], dims=[-1])
+            gain = 1.0 + (torch.rand(x.shape[0], 1, 1, 1,
+                                     device=x.device) - 0.5) * 0.2
+            bias = (torch.rand(x.shape[0], 1, 1, 1,
+                               device=x.device) - 0.5) * 0.1
+            x = (x * gain + bias).clamp(0, 1)
         beta = args.beta * min(1.0, step / max(1, args.beta_warmup_steps))
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -310,7 +330,8 @@ def train(args, dev):
             flo = (amp2 * (args.sigma_ref / sg - 1.0).clamp(min=0)).mean()
         else:
             flo = torch.zeros((), device=x.device)
-        loss = rec + beta * kl(mu, lv) + args.gamma_floater * flo
+        loss = rec + beta * kl_free(mu, lv, args.free_bits) \
+               + args.gamma_floater * flo
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step(); sched.step()
@@ -321,7 +342,7 @@ def train(args, dev):
             ips = nb * args.batch / (time.time() - t0); t0 = time.time()
             psnr = 10 * math.log10(1.0 / max(run_rec / nb, 1e-9))
             print(f"step {step:6d}/{args.steps}  rec {run_rec/nb:.4f} "
-                  f"(PSNR {psnr:4.1f})  kl {run_kl/nb:7.1f}  beta {beta:.2f}  "
+                  f"(PSNR {psnr:4.1f})  kl {run_kl/nb:7.1f}  beta {beta:.4g}  "
                   f"lr {sched.get_last_lr()[0]:.2e}  {ips:6.0f} img/s")
             logf.write(f"{step},{run_rec/nb:.6f},{run_kl/nb:.6f}\n"); logf.flush()
             run_rec = run_kl = 0.0
@@ -336,8 +357,14 @@ def train(args, dev):
                 rc = model.ren(model.dec(mu))
                 grid(torch.cat([fx, rc], 0),
                      os.path.join(args.out, f"recon_{step:06d}.png"))
-                grid(model.ren(model.dec(z_fixed)),
-                     os.path.join(args.out, f"sample_{step:06d}.png"))
+                samp = model.ren(model.dec(z_fixed))
+                grid(samp, os.path.join(args.out, f"sample_{step:06d}.png"))
+                v = samp[:32].reshape(32, -1)
+                sq = (v * v).sum(1)
+                d2 = (sq[:, None] + sq[None, :] - 2 * v @ v.T) / v.shape[1]
+                div = (d2.sum() / (32 * 31)).item()
+                print(f"        prior-sample diversity {div:.5f}  "
+                      f"(96px CelebA model ref ~0.12; << 0.05 = averaging)")
             model.train()
     print("done ->", os.path.join(args.out, "model2.pt"),
           " | now: python splat_trainer2.py --export")
@@ -427,7 +454,8 @@ def smoke():
         data_dir=imdir, out=tmp, image_size=32, num_packets=16, chunk=8,
         batch=8, steps=60, lr=3e-3, beta=1e-4, beta_warmup_steps=30,
         log_every=30, resume="", checkpointing=False, gamma_floater=0.02,
-        sigma_ref=0.03, onnx=os.path.join(tmp, "t.onnx"))
+        sigma_ref=0.03, onnx=os.path.join(tmp, "t.onnx"),
+        free_bits=0.0, aug=1)
     import io, contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -470,6 +498,14 @@ if __name__ == "__main__":
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--beta", type=float, default=1.0)
     ap.add_argument("--beta_warmup_steps", type=int, default=3000)
+    ap.add_argument("--free_bits", type=float, default=0.0,
+                    help="per-dim KL floor in nats (0 = off; try 0.03-0.10 "
+                         "with beta raised 10-50x). Diversity effect on this "
+                         "architecture is unmeasured — watch div in the log.")
+    ap.add_argument("--aug", type=int, default=1,
+                    help="1 = on-GPU horizontal flip + light brightness/"
+                         "contrast jitter (helps pose coverage and the "
+                         "webcam domain gap). 0 = off.")
     ap.add_argument("--gamma_floater", type=float, default=0.02,
                     help="anti-floater energy penalty (0 = off)")
     ap.add_argument("--sigma_ref", type=float, default=0.03,

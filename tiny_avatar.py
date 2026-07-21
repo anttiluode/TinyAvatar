@@ -117,16 +117,49 @@ def _arc_step(a, b, alpha):
     return a + alpha * d
 
 
+def _screw_step(px, py, th, pxT, pyT, thT, alpha):
+    """Fractional step along the SE(2) geodesic (screw motion: rotation
+    about a per-packet computed center). Certified in isolation
+    (fire_law_screw_test.py P4: recovers rigid rotation to 1.6e-16;
+    P5: identical to lerp on pure translation to 1.2e-16). As an avatar
+    mode this is a DEMO until the head-turn A/B is run."""
+    import torch, math
+    w = torch.remainder(thT - th + math.pi, 2 * math.pi) - math.pi
+    dx, dy = pxT - px, pyT - py
+    c, s = torch.cos(th), torch.sin(th)
+    dpx = c * dx + s * dy            # relative translation, packet frame
+    dpy = -s * dx + c * dy
+    small = w.abs() < 1e-6
+    ws = torch.where(small, torch.ones_like(w), w)
+    A = torch.sin(ws) / ws
+    B = (1 - torch.cos(ws)) / ws
+    det = A * A + B * B
+    vx = (A * dpx + B * dpy) / det   # V(w)^-1 dp
+    vy = (-B * dpx + A * dpy) / det
+    wt = w * alpha
+    At = torch.sin(wt) / ws
+    Bt = (1 - torch.cos(wt)) / ws
+    ex = torch.where(small, vx * alpha, At * vx - Bt * vy)
+    ey = torch.where(small, vy * alpha, Bt * vx + At * vy)
+    px2 = px + c * ex - s * ey       # back to world frame
+    py2 = py + s * ex + c * ey
+    return px2, py2, th + wt
+
+
 def pursue(P, T, alpha, mode):
     import torch
     px, py, s, th, f, c = P
     pxT, pyT, sT, thT, fT, cT = T
     L = lambda a, b: a + alpha * (b - a)
-    px2, py2, s2, f2 = L(px, pxT), L(py, pyT), L(s, sT), L(f, fT)
-    th2 = _arc_step(th, thT, alpha)
+    s2, f2 = L(s, sT), L(f, fT)
+    if mode == "screw":
+        px2, py2, th2 = _screw_step(px, py, th, pxT, pyT, thT, alpha)
+    else:
+        px2, py2 = L(px, pxT), L(py, pyT)
+        th2 = _arc_step(th, thT, alpha)
     if mode == "lerp":
         c2 = L(c, cT)
-    else:
+    else:                            # phase AND screw transport the phasor
         a_, b_ = c[..., 0], c[..., 1]
         aT, bT = cT[..., 0], cT[..., 1]
         m = torch.sqrt(a_ * a_ + b_ * b_ + 1e-12)
@@ -373,8 +406,7 @@ class ExtractWorker(QThread):
                 self.failed.emit("stopped by user"); return
             if n == 0:
                 self.failed.emit("no frames extracted"); return
-            note = (f" (rotated {meta}\u00b0 from phone metadata)"
-                    if rot_op is not None else "")
+            note = f" (rotated {meta}\u00b0 from phone metadata)" if rot_op is not None else ""
             self.finished_ok.emit(n, self.out + note)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -569,6 +601,13 @@ class TrainTab(QWidget):
         self.gamma = QDoubleSpinBox(); self.gamma.setDecimals(4)
         self.gamma.setRange(0.0, 1.0); self.gamma.setValue(0.02)
         f.addRow("gamma_floater (0 = off)", self.gamma)
+        self.free_bits = QDoubleSpinBox(); self.free_bits.setDecimals(3)
+        self.free_bits.setRange(0.0, 1.0); self.free_bits.setSingleStep(0.01)
+        self.free_bits.setValue(0.0)
+        f.addRow("free_bits (KL floor; lets beta rise)", self.free_bits)
+        self.aug_chk = QCheckBox("augmentation (flip + light jitter)")
+        self.aug_chk.setChecked(True)
+        f.addRow(self.aug_chk)
         self.log_every = QSpinBox(); self.log_every.setRange(10, 5000)
         self.log_every.setValue(250)
         f.addRow("log/save every N steps", self.log_every)
@@ -732,6 +771,10 @@ class TrainTab(QWidget):
                 "--lr", f"{self.lr.value():g}"]
         if "--gamma_floater" in self.flags:
             args += ["--gamma_floater", f"{self.gamma.value():g}"]
+        if "--free_bits" in self.flags:
+            args += ["--free_bits", f"{self.free_bits.value():g}"]
+        if "--aug" in self.flags:
+            args += ["--aug", "1" if self.aug_chk.isChecked() else "0"]
         if "--log_every" in self.flags:
             args += ["--log_every", str(self.log_every.value())]
         if resume:
@@ -842,7 +885,7 @@ class AvatarWorker(QThread):
         super().__init__()
         self.trainer_path, self.model_path = trainer_path, model_path
         self.source = source            # "webcam" | "walk"
-        self.mode = "phase"             # direct | lerp | phase
+        self.mode = "phase"             # direct | lerp | phase | screw
         self.kf = 8
         self.alpha = 0.35
         self.norm = True
@@ -978,7 +1021,8 @@ class AvatarTab(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["phase pursuit (certified transport)",
                                   "lerp pursuit (baseline)",
-                                  "direct (encode every frame)"])
+                                  "direct (encode every frame)",
+                                  "screw pursuit (demo)"])
         self.mode_combo.currentIndexChanged.connect(self.push_params)
         g.addWidget(QLabel("mode"), 0, 0); g.addWidget(self.mode_combo, 0, 1)
         self.kf_sl = QSlider(Qt.Orientation.Horizontal)
@@ -1037,7 +1081,15 @@ class AvatarTab(QWidget):
             self.model_combo.setCurrentIndex(0)
 
     def _mode(self):
-        return ["phase", "lerp", "direct"][self.mode_combo.currentIndex()]
+        idx = self.mode_combo.currentIndex()
+        if idx == 0:
+            return "phase"
+        elif idx == 1:
+            return "lerp"
+        elif idx == 2:
+            return "direct"
+        else:  # idx == 3
+            return "screw"
 
     def push_params(self):
         if self.worker:
