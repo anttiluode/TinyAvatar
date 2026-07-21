@@ -23,32 +23,11 @@ from a measurement to a formula (see **Ledger**).
 
 ## What's in the repo
 
-
-|
- file 
-|
- what it is 
-|
-|
----
-|
----
-|
-|
-`tiny_avatar.py`
-|
- the studio app — dataset prep, training, avatar driving, one window 
-|
-|
-`splat_trainer3v2.py`
-|
- the trainer (standalone CLI; the app wraps it as a subprocess) 
-|
-|
-`model2.pt`
-|
- a CelebA-trained checkpoint (96 px / 256 packets, ~22 MB) so you can try the avatar without training anything 
-|
+| File | What it is |
+|---|---|
+| `tiny_avatar.py` | The studio app — dataset preparation, training, and avatar driving, all in one window |
+| `splat_trainer3v2.py` | The trainer (standalone CLI; the app wraps it as a subprocess) |
+| `model2.pt` | A CelebA-trained checkpoint (96 px / 256 packets, ~22 MB) so you can try the avatar without training anything |
 
 **On file formats, honestly:** the studio drives `.pt` checkpoints only
 — the avatar needs the *encoder* (webcam frame → latent), and the
