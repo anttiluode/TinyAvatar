@@ -1,6 +1,6 @@
 # Tiny Avatar
 
-A ~7 MB face model you can train on yourself and drive live from a webcam —
+A ~22 MB face model you can train on yourself and drive live from a webcam —
 rendered by nothing but wave interference.
 
 A small VAE maps a 128-dimensional latent to a few hundred **Gabor wave
