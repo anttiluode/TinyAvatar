@@ -24,7 +24,7 @@ demonstrate, and it was tested before it was trusted (see **Ledger** below).
 |---|---|
 | `tiny_avatar.py` | the studio app — dataset prep, training, avatar driving, one window |
 | `splat_trainer3v2.py` | the trainer (standalone CLI; the app wraps it as a subprocess) |
-| `model.pt` | a CelebA-trained checkpoint (96 px / 256 packets) so you can try the avatar without training anything |
+| `model2.pt` | a CelebA-trained checkpoint (30k epochs)(96 px / 256 packets) so you can try the avatar without training anything |
 
 ## Install
 
