@@ -16,7 +16,7 @@ image dissolves into "fire"); rotating them keeps amplitude constant while
 the ripple physically glides. That is the one idea this repo exists to
 demonstrate, and it was tested before it was trusted (see **Ledger** below).
 
-![Training Studio](docs/screenshot.png)
+![Training Studio](avatar_studio.png)
 
 ## What's in the repo
 
