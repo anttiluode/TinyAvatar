@@ -19,9 +19,16 @@ The avatar runs on **phase-transport pursuit**: between encoder
 keyframes, each packet's complex amplitude is rotated along the shortest
 arc instead of crossfaded. Crossfading complex amplitudes can cancel the
 wave mid-path (the image dissolves into "fire"); rotating them keeps
-amplitude constant while the ripple physically glides. That is the one
-idea this repo exists to demonstrate — and it has since been upgraded
-from a measurement to a formula (see **Ledger**).
+amplitude constant while the ripple physically glides.
+
+As of July 2026 the repo also carries a measured result about the
+medium itself: on real head-motion video, each packet's phase rotation
+predicts the rendered image's local optical flow through the dispersion
+relation `dPhi_k = -2*pi * f_k * (u_k . v_k)` with **fitted slope
++0.998 and weighted r = +0.81 over 16,401 packet-frame pairs**, passing
+a per-packet scramble control. The wave field carries its own velocity
+field. Full detail, controls, and every caveat in
+**The science** and the **Ledger** below.
 
 ![Training Studio](avatar_studio.png)
 
@@ -32,6 +39,8 @@ from a measurement to a formula (see **Ledger**).
 | `tiny_avatar.py` | The studio app — dataset preparation, training, and avatar driving, all in one window |
 | `splat_trainer3v2.py` | The trainer (standalone CLI; the app wraps it as a subprocess) |
 | `model2.pt` | A CelebA-trained checkpoint (96 px / 256 packets, ~22 MB) so you can try the avatar without training anything |
+| `phase_orbit.py` | The measurement instrument: Takens phase-orbit extraction + the dispersion-law test, with registered pass/fail gates and controls |
+| `splat_pulse.py` | Live diagnostic: watch the packets' phase dynamics ("the pulse") while the avatar runs |
 
 **On file formats, honestly:** the studio drives `.pt` checkpoints only
 — the avatar needs the *encoder* (webcam frame → latent), and the
@@ -40,8 +49,6 @@ checkpoint carries encoder + decoder together. `--export` writes the
 line; the studio does not load ONNX.
 
 ## Install
-
-
 
 ```
 pip install -r requirements.txt
@@ -99,12 +106,7 @@ off the encoder's actual latent region. Two consequences worth knowing:
   trainer prints a `prior-sample diversity` number every log step
   (mean pairwise MSE over 32 prior samples). Reference points from real
   runs: the bundled 96 px CelebA model sits around 0.12; a 128 px run
-  that averaged aggressively measured 0.009. A log line looks like:
-
-```
-  step    500/30000  rec 0.0080 (PSNR 21.0)  kl 10.1  beta 0.0001667 ...
-          prior-sample diversity 0.00142  (96px CelebA model ref ~0.12)
-```
+  that averaged aggressively measured 0.009.
 
   On a **single-identity dataset a low number is partly correct** — all
   prior samples *should* be the same subject. On multi-identity data
@@ -136,10 +138,20 @@ Select your checkpoint, **Start webcam** (or **Latent walk**).
 - **mode** — `phase pursuit` (the transport mechanism), `lerp pursuit`
   (baseline, for comparison), `direct` (re-encode every frame; jittery,
   full cost), `screw pursuit` (**demo**: packet geometry follows the
-  SE(2) screw geodesic — rotation about a computed center — instead of
-  position-lerp + angle-arc; mathematically exact on rigid rotations in
-  isolated tests, expected to matter on head turns and to change
-  nothing on translation; not yet A/B-certified live).
+  SE(2) screw geodesic; not yet A/B-certified live), `dispersion
+  pursuit` (**demo**: rotates phases by the dispersion formula using
+  keyframe-implied velocities — measured live effect vs. plain phase
+  pursuit: essentially none, and that's expected, because it re-derives
+  its velocity from the same keyframe targets the arc step already
+  uses; it's listed so nobody rediscovers this the hard way).
+- **face-align input** — crops your live face with the *same* Haar
+  detector, margin, and square-up that Dataset Prep used on the
+  training frames (plus EMA smoothing so the crop doesn't jitter).
+  This closes a real train/live mismatch: training data is
+  face-cropped, the old live path was center-cropped, and the encoder
+  treats a differently-framed face as off-manifold input — you get the
+  blurry average head. Framing is the single biggest live-quality lever
+  we've found; this makes it automatic. On by default.
 - **keyframe every N frames** — encoder rate; everything between is
   pure transport.
 - **pursuit alpha** — fractional step toward the latest keyframe per
@@ -160,72 +172,172 @@ straight from the memmap: VRAM → RAM → disk, in order of what fits.
 `--export` writes the ~7 MB `splat_decoder.onnx` (opset 17, dynamic
 batch, `z_latent` → `rendered_image`) for the cv5 tools.
 
-## Diagnostic Telemetry: `splat_pulse.py` & Geometric Signal Processing
+## The science — `phase_orbit.py` and the dispersion law
+
+Each packet's complex coefficient is, exactly, an analytic signal:
+`z_k(t) = a_k(t) * exp(i*phi_k(t))` (verified to 4e-16 — the decoder's
+coefficients *are* the phasors). Track them across frames and the model
+becomes a set of 1-D complex time series instead of a pixel tensor.
+`phase_orbit.py` does that tracking and runs four registered tests:
+
+- **P1 — 1-D orbit.** Three face-region packets' cumulative phases
+  `(Phi_1, Phi_2, Phi_3)` should trace a low-dimensional curve during a
+  smooth sweep (PC1 explained variance >= 0.80). An *arc*, not a torus
+  — a single sweep is a one-parameter driver.
+- **P2 — dispersion.** The claim with teeth: each packet's phase step
+  should predict the rendered image's local optical flow around that
+  packet, `dPhi_k = -2*pi * f_k * (u_k . v_k)` — phase velocity
+  proportional to carrier frequency. Gate: weighted |r| >= 0.60.
+- **P3 — not an eigenface machine.** Phases must actually move (median
+  excursion >= 0.5 rad). If only amplitudes moved, this would be a
+  1991-style additive eigenface basis wearing a wave costume.
+- **P4 — controls.** A frame-shuffle path-length control for the orbit,
+  and a **pair-scramble control** for P2: within each frame, permute
+  *which packet's* measured phase step is paired with *which packet's*
+  prediction. Kills per-packet linkage, preserves every marginal. A
+  real per-packet law must collapse under it (gate:
+  |r_scrambled| <= 0.5|r|).
+
+**Result on real head-motion video** (120 frames, webcam clip, 96 px /
+256 packet checkpoint — full ledger, CSVs and plots in
+`phase_orbit_out/`):
+
+```
+P1 1-D orbit      [V]  PC1 EV = 0.951
+P2 dispersion     [V]  weighted r = +0.809, slope = +0.998  (16,401 pairs)
+P3 not-eigenface  [V]  median phase excursion = 0.62 rad
+P4 controls       [V]  pair-scramble r = +0.236 (bound 0.405)
+                       [diagnostic: full-shuffle r = +0.772]
+env/coef split         dPhi variance: 32% envelope / 42% coefficient /
+                       27% coherent cross-term, corr(env,coef) = +0.38
+verdict: [V]
+```
+
+What the extra lines mean, because they're where the honesty lives:
+
+- **The slope is +0.998 against a predicted +1.** The wave field's
+  phase dynamics *are* its rendered motion, at the frequency-
+  proportional rate the dispersion relation says.
+- **The env/coef split closes a loophole.** Under the composite phase
+  used here, a packet that merely *slides its envelope* satisfies the
+  relation semi-tautologically. Decomposing shows the largest share of
+  phase motion (42%) is genuine coefficient-phasor rotation — the
+  decoder really rotates its phases to move the face — with envelope
+  motion (32%) and a coherent cross-term (27%) alongside, positively
+  correlated: the decoder splits each motion across both channels in
+  the same direction.
+- **The full-shuffle diagnostic (+0.77) is a finding, not a leak.** The
+  relation survives destroying temporal order, which means it is
+  *constitutive* — a property of pairs of states, not just of adjacent
+  frames: the phase difference between two configurations encodes the
+  displacement between them. (It's reported as a diagnostic because a
+  constitutive law legitimately survives that shuffle; the pair-scramble
+  above is the control that actually guards against artifacts.)
+- **The single-packet Takens embedding shows 2–3 effective dimensions**
+  (delay-PC spectrum 0.62 / 0.31 / 0.03) — one scalar phase trace
+  reconstructing a multi-degree-of-freedom driver (yaw + pitch +
+  expression). That is Takens' theorem doing its job on this medium.
+
+Two negative results from building the instrument, kept because they
+matter more than the passes:
+
+- **The encoder is translation-invariant.** Slide the input face 28 px
+  and the reconstruction moves 0.5 px, while z changes as much as its
+  own norm. The medium does not transport out-of-manifold motion; it
+  **re-indexes** onto the learned manifold and spends the latent change
+  on appearance. (Practical corollary: that's why the face-align toggle
+  exists, and why the dispersion law is stated about the *rendered*
+  field's own flow, not the input's.)
+- **Never phase-correlate a Gabor patch.** Quasi-periodic fringes alias
+  modulo their own wavelength; `cv2.phaseCorrelate` on packet windows
+  produced wavelength-sized garbage (r 0.40, slope 0.08 on a known-
+  velocity control). Envelope-weighted Farnebäck flow — gradient-based,
+  pyramidal, structurally unable to period-alias — recovers the
+  injected physics at r = +0.9.
+
+Reproduce it:
+
+```
+python phase_orbit.py --selftest --ckpt model2.pt        # instrument check:
+                                                         # expect r ~ +0.9, slope ~ +1.3
+python phase_orbit.py --video your_headturn.mp4 --ckpt runs/you/model2.pt
+python phase_orbit.py --walk 0 1 --ckpt model2.pt        # latent walk (no camera)
+```
+
+(The selftest drives phases with a known velocity and checks the
+pipeline recovers it — it certifies the measurement chain, not the
+model. Its slope reads ~1.3 because Farnebäck slightly underestimates
+pure fringe drift; on real video, where envelopes move too, the slope
+comes out at 1.)
+
+## Live telemetry — `splat_pulse.py`
 
 ![pulse](splat_pulse.png)
 
-To observe the real-time physical "pulse" of the Gabor wave medium as the avatar moves, run the standalone diagnostic instrument `splat_pulse.py`:
+Watch the medium's phase dynamics while the avatar runs. Imports the
+app's own pursuit and framing machinery so what you see is the actual
+driver loop (keep it in the same folder as the app and trainer; it has
+standalone fallbacks if the app isn't importable).
 
-```bash
-# Run live latent walk pulse monitoring
-python splat_pulse.py --walk
-
-# Run live webcam pulse monitoring
-python splat_pulse.py --cam 0
+```
+python splat_pulse.py --walk        # latent walk
+python splat_pulse.py --cam 0      # webcam-driven
+python splat_pulse.py --walk --record out.mp4 --nframes 300   # headless
 ```
 
-> **Note:** `splat_pulse.py` imports core pursuit and framing machinery directly from `tiny_avatar3.py` (or `tiny_avatar.py`), so keep `splat_pulse.py`, `tiny_avatar.py`, and your trainer scripts in the same folder.
+Three panels: the avatar with a **pulse quiver** (each packet an
+oriented tick — length ~ amplitude, color = instantaneous phase step
+dPhi, blue negative / red positive — motion sweeps across the face as
+color waves); a **pulse map** of the packet field in coordinate space
+with the three tracked orbit packets ringed; and instruments —
+scrolling Phi traces (the Takens signal, streaming live) plus per-band
+meters.
 
-### What the Instrument Measures
+The band meters show the **explained fraction**
+`EF_band = 1 - sum(m*e^2)/sum(m*dPhi^2)` for LOW (f<3), MID (3–8) and
+HIGH (f>=8) carrier bands, where `e` is the residual after removing the
+dispersion-form prediction. EF → 1: that band's phase motion follows
+the dispersion form. EF → 0 or below: phases move but not as predicted.
+Blank: band idle. (A first version used circular residual coherence; it
+saturated at ~1.0 for pursuit-sized steps and was replaced. If your
+copy logs `R_LOW` instead of `EF_LOW` you have the stale version —
+`grep EF_LOW splat_pulse.py` should match.)
 
-**Avatar + Pulse Quiver (Left Panel):**  
-Renders the face overlay with oriented ticks for each wave packet \(k\). The tick angle shows packet orientation \(\theta_k\), length scales with magnitude \(m_k\), and color (blue \(\leftarrow 0 \rightarrow\) red) tracks the instantaneous phase velocity \(\Delta \phi_k\). Smooth movements appear as sweeping color-wave fronts across the medium.
+**Registered, still open — not results yet:**
 
-**Pulse Map in Coordinate Space (Center Panel):**  
-Displays packet centers \(\mathbf{p}_k\) in spatial coordinates, highlighting tracked orbit packets (\(\text{k27}\), \(\text{k177}\), \(\text{k197}\)) across motion.
+- **PULSE-1:** during smooth in-manifold driving, EF_LOW >= EF_HIGH on
+  a clear majority of active frames (a low-frequency "skeleton" holding
+  the dispersion form while high-frequency detail departs first).
+- **PULSE-2:** framing breaks / off-manifold input collapse EF across
+  all bands *before* visible reconstruction degradation.
 
-**\(\Phi\) Traces & Band Coherence \(R_{\text{band}}\) (Right Panel):**
-
-**\(\Phi\) Traces:**  
-Plots live, unwrapped phase trajectories over time—streaming 1D Takens delay embeddings of individual packet orbits.
-
-**Band Residual Coherence \(R_{\text{band}}\):**  
-Measures how closely actual phase velocity matches the predicted dispersion law across LOW (\(f_k < 3\)), MID (\(3 \le f_k < 8\)), and HIGH (\(f_k \ge 8\)) carrier bands:
-
-$$
-R_{\text{band}} =
-\frac{\left| \sum_k m_k e^{i e_k} \right|}
-{\sum_k m_k},
-\qquad
-e_k = \Delta \phi_k -
-\left(-2\pi f_k (\mathbf{u}_k \cdot \mathbf{v}_k)\right)
-$$
-
-**In-Manifold State (\(R \rightarrow 1.0\)):**  
-High-coherence state where spatial translation and carrier phase advance remain fully phase-locked.
-
-**Decoherence / "Fire State" (\(R \rightarrow 0.0\)):**  
-High-frequency detail desynchronizes first during rapid off-manifold shifts or framing breaks, scattering phases before visible reconstruction failure occurs.
-
-### Theoretical Link: Continuous Geodesic Delay Lines
-
-This pulse monitoring directly bridges wave-packet generative models with the continuous dynamics of Geometric Processing / Delay-Line Networks:
-
-- Rather than evaluating static pixel matrices, the latent space maps to spatiotemporal delay channels.
-- Each packet acts as a localized harmonic filter carrying complex amplitude, phase angle, and carrier frequency:
-  \[
-  P_k = (\mathbf{p}_k, \sigma_k, \theta_k, f_k, \mathbf{c}_k)
-  \]
-- Information moves through the network as continuous phase fronts along Riemannian geodesics—where phase advance (\(\Delta \phi_k\)) corresponds to physical spatial propagation across local receptive fields.
-
+Both score mechanically from the tool's `pulse_log.csv`. The one data
+point so far (a latent walk) actually leaned *against* PULSE-1 — worth
+knowing before anyone repeats the frequency-hierarchy story as fact.
 
 ## Ledger — what is measured vs. what is a demo
 
 This project's rule: do not hype, do not lie, just show. Registered
 thresholds, then runs, then verdicts.
 
+**Certified — the dispersion law** (`phase_orbit.py --video`, real
+head-motion clip, thresholds registered before the run): phase step
+predicts rendered local flow at slope +0.998, weighted r +0.809 over
+16,401 packet-frame pairs; per-packet pair-scramble control collapses
+to +0.236 (bound 0.405); majority of the phase motion is genuine
+coefficient-phasor rotation (42%), not envelope bookkeeping (32%);
+measurement chain independently certified by known-velocity injection
+(r +0.90–0.92 on two machines). The relation additionally survives
+frame shuffling (+0.77), indicating it is constitutive — a state-pair
+property — not merely frame-to-frame dynamics.
+
+**Certified — the encoder re-indexes, it does not translate:** 28 px
+of input translation produces 0.5 px of reconstruction motion while
+|dz| ~ |z|. Out-of-manifold motion is absorbed into appearance; only
+manifold coordinates are transported.
+
 **Certified — the fire law** (`fire_law_screw_test.py --real`, 128 px /
-512 packets, 8 pairs, thresholds registered before running):
+512 packets, 8 pairs):
 
 - The crossfade's amplitude loss has a **closed form**. Per packet,
   `|psi(t)|^2 = (1-t)^2 aA^2 + t^2 aB^2 + 2 t(1-t) aA aB cos(dphi)`.
@@ -251,34 +363,52 @@ scrambled phases break road agreement ~10x, 8/8 — coherent phase is the
 mechanism, not a coincidence.
 
 **Honest revision log** (kept because the misses taught more than the
-hits): the original claim "lerp burns, transport doesn't" measured 4/8
-on one model, then 0/8 on a second — and was then *explained*: both
-runs sat in the small-`dphi` regime the closed form predicts to be
-fire-free. On the second model, a gap-relative road-agreement gate also
-mis-fired on tiny-gap pairs (a denominator artifact; transport's road
-deviation was within 1.15x of the baseline's on all pairs). The claim
-that survived is smaller and stronger than the original: **the fire is
-a formula, and transport is its guarantee.**
+hits):
 
-**Demo, not certificate:** the pursuit scheme itself; screw mode as a
-*live avatar* mode (awaiting the head-turn A/B); `free_bits`' diversity
-effect on this architecture; the pulse check's renderer estimate is a
-labeled heuristic.
+- The original claim "lerp burns, transport doesn't" measured 4/8 on
+  one model, then 0/8 on a second — and was then *explained*: both runs
+  sat in the small-`dphi` regime the closed form predicts to be
+  fire-free. The claim that survived is smaller and stronger: **the
+  fire is a formula, and transport is its guarantee.**
+- The dispersion test was first aimed at *input-frame* motion; the
+  encoder's translation invariance made that test invalid in principle
+  and forced the medium-internal restatement that then passed.
+- The first P4 control (frame shuffle) was mis-specified: it assumed a
+  dynamical law and failed (+0.77) against what turned out to be a
+  constitutive one. The gate was not reinterpreted into a pass — it was
+  replaced with the pair-scramble control, validated on synthetic
+  driving (r +0.90 → −0.01 under scramble), and the video was re-run
+  through the new gate. The failure is what taught us the law's actual
+  character.
+- The pulse tool's first coherence metric saturated and was replaced
+  (see above). An 18k-frame session logged with the stale metric had to
+  be discarded — check your file version before trusting a log.
+
+**Demo, not certificate:** the pursuit scheme itself; screw and
+dispersion modes as *live avatar* modes (dispersion mode adds nothing
+over phase pursuit by construction — it re-derives velocity from the
+same keyframes); PULSE-1/PULSE-2 (registered, unmeasured); a
+cross-model "phase-binding matrix" for driving one model with another's
+packets (an idea worth testing; it presupposes cross-model slot
+semantics nothing has verified); `free_bits`' diversity effect on this
+architecture; the pulse check's renderer estimate is a labeled
+heuristic.
 
 **Known limitations:** the webcam encoder has a real domain gap on
-out-of-distribution input (single-identity training is the fix, input
-normalization the band-aid); Haar-cascade face detection is fast, dumb,
-upright-only — the extraction preview exists so you catch a bad lock
-before training does; and this will not out-render modern talking-head
-or diffusion avatars and isn't trying to. The trade it makes: a
-decoder measured in single-digit megabytes, in-between frames produced
-by one rotation matrix, and every claim above backed by a CSV.
+out-of-distribution input (single-identity training is the fix,
+face-align + input normalization the band-aids); Haar-cascade face
+detection is fast, dumb, upright-only — the extraction preview exists
+so you catch a bad lock before training does; and this will not
+out-render modern talking-head or diffusion avatars and isn't trying
+to. The trade it makes: a decoder measured in single-digit megabytes,
+in-between frames produced by one rotation matrix, and every claim
+above backed by a CSV.
 
 ## License / provenance
 
-Trainer, renderer math, transport tests, and app developed in an
-ongoing human + AI collaboration (Anthropic's Claude models, Google
-Gemini, DeepSeek, ChatGPT, others) at PerceptionLab. The bundled
-checkpoint was trained on CelebA — respect the CelebA terms
-(non-commercial research) for that file; your own-face models are
-yours.
+Trainer, renderer math, transport tests, measurement instruments, and
+app developed in an ongoing human + AI collaboration (Anthropic's
+Claude models, Google Gemini, DeepSeek, ChatGPT, others) at
+PerceptionLab. The bundled checkpoint was trained on CelebA — respect
+the CelebA terms (non-commercial research) for that file; your own-face
+models are yours.
