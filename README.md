@@ -1,5 +1,7 @@
 # Tiny Avatar
 
+Video about it: https://www.youtube.com/watch?v=6TzSXNmUlxE
+
 ![tiny](tiny.png)
 
 A tiny wave-interference face model you can train on yourself and drive
