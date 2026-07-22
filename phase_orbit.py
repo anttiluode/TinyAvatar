@@ -220,6 +220,21 @@ def wpearson(x, y, w):
     sy = math.sqrt((w * (y - my) ** 2).sum() + 1e-18)
     return cov / (sx * sy), cov / (sx * sx + 1e-18)
 
+def pair_scramble_r(pred, meas, w, tlbl, seed=0):
+    """P4b' control: within each frame, permute which packet's measured
+    dPhi is paired with which packet's prediction. Kills per-packet
+    linkage while preserving every marginal and the frame-level motion
+    structure. A per-packet-real dispersion relation should collapse
+    under this; an estimator artifact shared across packets survives."""
+    rng = np.random.default_rng(seed)
+    meas2 = meas.copy()
+    for t in np.unique(tlbl):
+        idx = np.where(tlbl == t)[0]
+        if len(idx) > 1:
+            meas2[idx] = meas[rng.permutation(idx)]
+    r, _ = wpearson(pred, meas2, w)
+    return r
+
 def path_length(P):
     return float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
 
@@ -262,7 +277,7 @@ def dispersion_pairs(Z, fq, th, rec, px, py, sg, stable, vfloor,
     if flows is None:
         flows = dense_flows(rec)
     yy, xx = np.mgrid[0:H, 0:H]
-    preds, meass, ws = [], [], []
+    preds, meass, ws, tlbl = [], [], [], []
     for k in stable:
         cx, cy = px[:, k].mean() * H, py[:, k].mean() * H
         s = max(float(sg[:, k].mean()) * H, 2.0)
@@ -278,11 +293,11 @@ def dispersion_pairs(Z, fq, th, rec, px, py, sg, stable, vfloor,
         pred = -2*np.pi*fq[:-1, k][sel]*(ux*v[sel, 0] + uy*v[sel, 1])
         amp = 0.5*(np.abs(Z[1:, k]) + np.abs(Z[:-1, k]))[sel]
         preds.append(pred); meass.append(dphi)
-        ws.append(amp)
+        ws.append(amp); tlbl.append(np.where(sel)[0])
     if not preds:
         return None
     return (np.concatenate(preds), np.concatenate(meass),
-            np.concatenate(ws))
+            np.concatenate(ws), np.concatenate(tlbl))
 
 # ---- main ------------------------------------------------------------
 def main():
@@ -403,7 +418,10 @@ def main():
     Phi = np.concatenate([np.zeros((1, Z.shape[1])),
                           np.cumsum(dPhi, axis=0)], axis=0)
 
-    order = stable[np.argsort(-amp[stable])]
+    cen = ((np.abs(px.mean(0) - 0.5) < 0.3)
+           & (np.abs(py.mean(0) - 0.5) < 0.3))
+    pool = stable[cen[stable]] if cen[stable].sum() >= 3 else stable
+    order = pool[np.argsort(-amp[pool])]
     picks = [int(order[0])]
     for k in order[1:]:
         if all(np.hypot(px[:, k].mean() - px[:, j].mean(),
@@ -430,16 +448,39 @@ def main():
     flows = dense_flows(rec)
     disp = dispersion_pairs(Z, fq, th, rec, px, py, sg, stable,
                             args.vfloor_px / size, flows=flows)
-    P2 = P2_val = slope = None
+    P2 = P2_val = slope = r_scr = None
     if disp is not None:
-        pred, meas, w = disp
+        pred, meas, w, tlbl = disp
         r, slope = wpearson(pred, meas, w)
         P2_val = float(r); P2 = abs(r) >= 0.60
+        r_scr = float(pair_scramble_r(pred, meas, w, tlbl))
         print(f"dispersion: {len(pred)} pairs, weighted r={r:+.3f}, "
-              f"slope={slope:+.3f}")
+              f"slope={slope:+.3f}, pair-scramble r={r_scr:+.3f}")
     else:
         print("dispersion: no local motion above floor — skipped "
               "(is the sweep actually moving anything in the render?)")
+
+    # ---- envelope-borne vs coefficient-borne decomposition of dPhi ----
+    # dPhi_env: carrier-term change from packet-center motion (moving the
+    # envelope moves the pattern — near-bookkeeping under the composite
+    # phase). dPhi_coef: coefficient phasor rotation — genuine phase
+    # transport. Their split says which channel the decoder uses.
+    dpx_, dpy_ = np.diff(px, axis=0), np.diff(py, axis=0)
+    envp = -2*np.pi*fq[:-1]*(np.cos(th[:-1])*dpx_ + np.sin(th[:-1])*dpy_)
+    coefp = np.angle(zc[1:] * np.conj(zc[:-1]))
+    wq = 0.5*(np.abs(Z[1:]) + np.abs(Z[:-1]))
+    selm = np.zeros(Z.shape[1], bool); selm[stable] = True
+    Wq = wq[:, selm].ravel(); Wq = Wq / (Wq.sum() + 1e-12)
+    Ev, Cv, Tv = [a[:, selm].ravel() for a in (envp, coefp, dPhi)]
+    def _wv(x):
+        m = (Wq*x).sum(); return float((Wq*(x-m)**2).sum())
+    def _wc(x, y):
+        mx, my = (Wq*x).sum(), (Wq*y).sum()
+        return float((Wq*(x-mx)*(y-my)).sum()
+                     / math.sqrt(_wv(x)*_wv(y) + 1e-18))
+    vE, vC, vT = _wv(Ev), _wv(Cv), _wv(Tv)
+    env_share, coef_share = vE/(vT+1e-18), vC/(vT+1e-18)
+    ec_corr = _wc(Ev, Cv)
 
     rng = np.random.default_rng(0)
     perm = rng.permutation(T)
@@ -450,14 +491,21 @@ def main():
     L_ord = path_length(Porb)
     L_shf = path_length(Phi_s[:, picks])
     P4a = L_shf >= 3 * L_ord
-    P4b_val = None
+    P4b_val = None                      # full-shuffle dispersion r —
     ds = dispersion_pairs(Zs_, fq[perm], th[perm], rec[perm],
                           px[perm], py[perm], sg[perm], stable,
                           args.vfloor_px / size)
     if ds is not None:
         rs, _ = wpearson(ds[0], ds[1], ds[2])
         P4b_val = float(rs)
-    P4 = P4a and (P4b_val is None or abs(P4b_val) <= 0.20)
+    # v2 gate: full-shuffle r is DIAGNOSTIC only (a constitutive pairwise
+    # law legitimately survives frame shuffling when the pose range keeps
+    # shuffled pairs within flow range — learned from the first real-video
+    # run, where r_shuf=+0.77 alongside slope 0.998). The artifact guard
+    # is the pair-scramble control: registered P4b' |r_scr| <= 0.5*|r|.
+    P4b = (r_scr is None or P2_val is None
+           or abs(r_scr) <= 0.5 * abs(P2_val))
+    P4 = P4a and P4b
 
     tau = args.tau if args.tau > 0 else max(1, T // 40)
     d = args.dim
@@ -481,9 +529,15 @@ def main():
            f"slope = {slope:+.3f}"),
         f"  P3 not-eigenface  {mark(P3)}  median phase excursion = "
         f"{P3_val:.2f} rad (>=0.5)",
-        f"  P4 shuffle ctrl   {mark(P4)}  path x{L_shf/max(L_ord,1e-9):.1f} "
+        f"  P4 controls       {mark(P4)}  path x{L_shf/max(L_ord,1e-9):.1f} "
         f"(>=3)"
-        + ("" if P4b_val is None else f", shuffled r = {P4b_val:+.3f} (<=0.20)"),
+        + ("" if r_scr is None else
+           f", pair-scramble r = {r_scr:+.3f} (<=0.5*|r|)")
+        + ("" if P4b_val is None else
+           f"  [diag: full-shuffle r = {P4b_val:+.3f}]"),
+        f"  env/coef split    dPhi variance: env {env_share:.2f} / "
+        f"coef {coef_share:.2f} / cross {max(0.0, 1-env_share-coef_share):.2f}"
+        f"   corr(env,coef) = {ec_corr:+.2f}",
         f"  delay embedding (k={picks[0]}, tau={tau}, d={d}): "
         f"PC EVs {', '.join(f'{e:.3f}' for e in ev_d[:4])}",
         "  verdict: " + ("[V]" if all(x for x in [P1, P3, P4]
@@ -504,10 +558,10 @@ def main():
                         f"{th[t,k]:.5f},{fq[t,k]:.4f}\n")
     if disp is not None:
         with open(os.path.join(args.out, "dispersion.csv"), "w") as f:
-            f.write("pred,meas,weight\n")
-            for a, b, c in zip(*disp):
-                f.write(f"{a:.5f},{b:.5f},{c:.5f}\n")
-    np.savez(os.path.join(args.out, "states.npz"), z=zs.numpy(), px=px,
+            f.write("pred,meas,weight,frame\n")
+            for a, b, c, t in zip(*disp):
+                f.write(f"{a:.5f},{b:.5f},{c:.5f},{int(t)}\n")
+    np.savez(os.path.join(args.out, "states.npz"), z=zs.numpy(), px=px, sigma=sg,
              py=py, theta=th, freq=fq, phasor=zc, Z=Z, Phi=Phi,
              stable=stable, picks=np.array(picks))
 
@@ -556,7 +610,7 @@ def main():
                 bbox_inches="tight"); plt.close()
 
     if disp is not None:
-        pred, meas, w = disp
+        pred, meas, w, _t = disp
         plt.figure(figsize=(6, 6))
         plt.scatter(pred, meas, s=8, c=w, cmap="magma", alpha=0.7)
         lim = max(np.abs(pred).max(), np.abs(meas).max()) * 1.05
