@@ -1,5 +1,7 @@
 # Tiny Avatar
 
+![tiny](tiny.png)
+
 A tiny wave-interference face model you can train on yourself and drive
 live from a webcam. The training checkpoint is ~22 MB; its exported
 decoder — the generative half — is ~7 MB of ONNX. Rendered by nothing
@@ -37,7 +39,10 @@ line; the studio does not load ONNX.
 
 ## Install
 
+
+
 ```
+pip install -r requirements.txt
 pip install torch PyQt6 opencv-python numpy psutil
 pip install pynvml        # optional: GPU % readout in the training tab
 python tiny_avatar.py
