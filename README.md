@@ -160,6 +160,65 @@ straight from the memmap: VRAM → RAM → disk, in order of what fits.
 `--export` writes the ~7 MB `splat_decoder.onnx` (opset 17, dynamic
 batch, `z_latent` → `rendered_image`) for the cv5 tools.
 
+## Diagnostic Telemetry: `splat_pulse.py` & Geometric Signal Processing
+
+![pulse](splat_pulse.png)
+
+To observe the real-time physical "pulse" of the Gabor wave medium as the avatar moves, run the standalone diagnostic instrument `splat_pulse.py`:
+
+```bash
+# Run live latent walk pulse monitoring
+python splat_pulse.py --walk
+
+# Run live webcam pulse monitoring
+python splat_pulse.py --cam 0
+```
+
+> **Note:** `splat_pulse.py` imports core pursuit and framing machinery directly from `tiny_avatar3.py` (or `tiny_avatar.py`), so keep `splat_pulse.py`, `tiny_avatar.py`, and your trainer scripts in the same folder.
+
+### What the Instrument Measures
+
+**Avatar + Pulse Quiver (Left Panel):**  
+Renders the face overlay with oriented ticks for each wave packet \(k\). The tick angle shows packet orientation \(\theta_k\), length scales with magnitude \(m_k\), and color (blue \(\leftarrow 0 \rightarrow\) red) tracks the instantaneous phase velocity \(\Delta \phi_k\). Smooth movements appear as sweeping color-wave fronts across the medium.
+
+**Pulse Map in Coordinate Space (Center Panel):**  
+Displays packet centers \(\mathbf{p}_k\) in spatial coordinates, highlighting tracked orbit packets (\(\text{k27}\), \(\text{k177}\), \(\text{k197}\)) across motion.
+
+**\(\Phi\) Traces & Band Coherence \(R_{\text{band}}\) (Right Panel):**
+
+**\(\Phi\) Traces:**  
+Plots live, unwrapped phase trajectories over time—streaming 1D Takens delay embeddings of individual packet orbits.
+
+**Band Residual Coherence \(R_{\text{band}}\):**  
+Measures how closely actual phase velocity matches the predicted dispersion law across LOW (\(f_k < 3\)), MID (\(3 \le f_k < 8\)), and HIGH (\(f_k \ge 8\)) carrier bands:
+
+$$
+R_{\text{band}} =
+\frac{\left| \sum_k m_k e^{i e_k} \right|}
+{\sum_k m_k},
+\qquad
+e_k = \Delta \phi_k -
+\left(-2\pi f_k (\mathbf{u}_k \cdot \mathbf{v}_k)\right)
+$$
+
+**In-Manifold State (\(R \rightarrow 1.0\)):**  
+High-coherence state where spatial translation and carrier phase advance remain fully phase-locked.
+
+**Decoherence / "Fire State" (\(R \rightarrow 0.0\)):**  
+High-frequency detail desynchronizes first during rapid off-manifold shifts or framing breaks, scattering phases before visible reconstruction failure occurs.
+
+### Theoretical Link: Continuous Geodesic Delay Lines
+
+This pulse monitoring directly bridges wave-packet generative models with the continuous dynamics of Geometric Processing / Delay-Line Networks:
+
+- Rather than evaluating static pixel matrices, the latent space maps to spatiotemporal delay channels.
+- Each packet acts as a localized harmonic filter carrying complex amplitude, phase angle, and carrier frequency:
+  \[
+  P_k = (\mathbf{p}_k, \sigma_k, \theta_k, f_k, \mathbf{c}_k)
+  \]
+- Information moves through the network as continuous phase fronts along Riemannian geodesics—where phase advance (\(\Delta \phi_k\)) corresponds to physical spatial propagation across local receptive fields.
+
+
 ## Ledger — what is measured vs. what is a demo
 
 This project's rule: do not hype, do not lie, just show. Registered
@@ -214,6 +273,63 @@ before training does; and this will not out-render modern talking-head
 or diffusion avatars and isn't trying to. The trade it makes: a
 decoder measured in single-digit megabytes, in-between frames produced
 by one rotation matrix, and every claim above backed by a CSV.
+
+## Diagnostic Telemetry: `splat_pulse.py` & Geometric Signal Processing
+
+To observe the real-time physical "pulse" of the Gabor wave medium as the avatar moves, run the standalone diagnostic instrument `splat_pulse.py`:
+
+```bash
+# Run live latent walk pulse monitoring
+python splat_pulse.py --walk
+
+# Run live webcam pulse monitoring
+python splat_pulse.py --cam 0
+```
+
+> **Note:** `splat_pulse.py` imports core pursuit and framing machinery directly from `tiny_avatar3.py` (or `tiny_avatar.py`), so keep `splat_pulse.py`, `tiny_avatar.py`, and your trainer scripts in the same folder.
+
+### What the Instrument Measures
+
+**Avatar + Pulse Quiver (Left Panel):**  
+Renders the face overlay with oriented ticks for each wave packet \(k\). The tick angle shows packet orientation \(\theta_k\), length scales with magnitude \(m_k\), and color (blue \(\leftarrow 0 \rightarrow\) red) tracks the instantaneous phase velocity \(\Delta \phi_k\). Smooth movements appear as sweeping color-wave fronts across the medium.
+
+**Pulse Map in Coordinate Space (Center Panel):**  
+Displays packet centers \(\mathbf{p}_k\) in spatial coordinates, highlighting tracked orbit packets (\(\text{k27}\), \(\text{k177}\), \(\text{k197}\)) across motion.
+
+**\(\Phi\) Traces & Band Coherence \(R_{\text{band}}\) (Right Panel):**
+
+**\(\Phi\) Traces:**  
+Plots live, unwrapped phase trajectories over time—streaming 1D Takens delay embeddings of individual packet orbits.
+
+**Band Residual Coherence \(R_{\text{band}}\):**  
+Measures how closely actual phase velocity matches the predicted dispersion law across LOW (\(f_k < 3\)), MID (\(3 \le f_k < 8\)), and HIGH (\(f_k \ge 8\)) carrier bands:
+
+$$
+R_{\text{band}} =
+\frac{\left| \sum_k m_k e^{i e_k} \right|}
+{\sum_k m_k},
+\qquad
+e_k = \Delta \phi_k -
+\left(-2\pi f_k (\mathbf{u}_k \cdot \mathbf{v}_k)\right)
+$$
+
+**In-Manifold State (\(R \rightarrow 1.0\)):**  
+High-coherence state where spatial translation and carrier phase advance remain fully phase-locked.
+
+**Decoherence / "Fire State" (\(R \rightarrow 0.0\)):**  
+High-frequency detail desynchronizes first during rapid off-manifold shifts or framing breaks, scattering phases before visible reconstruction failure occurs.
+
+### Theoretical Link: Continuous Geodesic Delay Lines
+
+This pulse monitoring directly bridges wave-packet generative models with the continuous dynamics of Geometric Processing / Delay-Line Networks:
+
+- Rather than evaluating static pixel matrices, the latent space maps to spatiotemporal delay channels.
+- Each packet acts as a localized harmonic filter carrying complex amplitude, phase angle, and carrier frequency:
+  \[
+  P_k = (\mathbf{p}_k, \sigma_k, \theta_k, f_k, \mathbf{c}_k)
+  \]
+- Information moves through the network as continuous phase fronts along Riemannian geodesics—where phase advance (\(\Delta \phi_k\)) corresponds to physical spatial propagation across local receptive fields.
+
 
 ## License / provenance
 
