@@ -99,7 +99,6 @@ def import_trainer(path):
 
 
 # ---------------------------------------------------------------- certified math
-# ported verbatim from avatar_driver.py — do not "improve"
 def render_image(ren, P):
     import torch
     px, py, sigma, theta, freq, coeff = P
@@ -118,11 +117,7 @@ def _arc_step(a, b, alpha):
 
 
 def _screw_step(px, py, th, pxT, pyT, thT, alpha):
-    """Fractional step along the SE(2) geodesic (screw motion: rotation
-    about a per-packet computed center). Certified in isolation
-    (fire_law_screw_test.py P4: recovers rigid rotation to 1.6e-16;
-    P5: identical to lerp on pure translation to 1.2e-16). As an avatar
-    mode this is a DEMO until the head-turn A/B is run."""
+    """Fractional step along the SE(2) geodesic (screw motion)."""
     import torch, math
     w = torch.remainder(thT - th + math.pi, 2 * math.pi) - math.pi
     dx, dy = pxT - px, pyT - py
@@ -147,19 +142,55 @@ def _screw_step(px, py, th, pxT, pyT, thT, alpha):
 
 
 def pursue(P, T, alpha, mode):
-    import torch
+    """
+    Pursuit modes:
+      - 'direct'    : re-encode every frame
+      - 'lerp'      : linear crossfade baseline
+      - 'phase'     : shortest-arc phase transport
+      - 'screw'     : SE(2) rigid rotation + phase transport
+      - 'dispersion': closed-form phase advance via frequency-weighted local flow
+    """
+    import torch, math
     px, py, s, th, f, c = P
     pxT, pyT, sT, thT, fT, cT = T
     L = lambda a, b: a + alpha * (b - a)
     s2, f2 = L(s, sT), L(f, fT)
+
     if mode == "screw":
         px2, py2, th2 = _screw_step(px, py, th, pxT, pyT, thT, alpha)
     else:
         px2, py2 = L(px, pxT), L(py, pyT)
         th2 = _arc_step(th, thT, alpha)
+
     if mode == "lerp":
         c2 = L(c, cT)
-    else:                            # phase AND screw transport the phasor
+    elif mode == "dispersion":
+        # Measure local spatial velocity per packet
+        vx = alpha * (pxT - px)
+        vy = alpha * (pyT - py)
+        ux, uy = torch.cos(th), torch.sin(th)
+        
+        # Closed-form phase advance rate (dispersion form; NOTE the
+        # r=0.915 figure was the --selftest CHAIN certification, not a
+        # real-video measurement — the real-pose P2 run is still open)
+        dphi_disp = -2.0 * math.pi * f * (ux * vx + uy * vy)
+        
+        # Extract magnitude & current phase
+        a_, b_ = c[..., 0], c[..., 1]
+        aT, bT = cT[..., 0], cT[..., 1]
+        m = torch.sqrt(a_ * a_ + b_ * b_ + 1e-12)
+        mT = torch.sqrt(aT * aT + bT * bT + 1e-12)
+        ph = torch.atan2(b_, a_)
+        phT = torch.atan2(bT, aT)
+        m2 = L(m, mT)
+        
+        # Shortest-arc target step
+        dphi_arc = _arc_step(ph, phT, alpha) - ph
+        
+        # Blend dispersion phase velocity with arc target to prevent multi-frame drift
+        ph2 = ph + 0.7 * dphi_disp + 0.3 * dphi_arc
+        c2 = torch.stack([m2 * torch.cos(ph2), m2 * torch.sin(ph2)], dim=-1)
+    else:                            # 'phase' and 'screw' transport
         a_, b_ = c[..., 0], c[..., 1]
         aT, bT = cT[..., 0], cT[..., 1]
         m = torch.sqrt(a_ * a_ + b_ * b_ + 1e-12)
@@ -169,7 +200,60 @@ def pursue(P, T, alpha, mode):
         m2 = L(m, mT)
         ph2 = _arc_step(ph, phT, alpha)
         c2 = torch.stack([m2 * torch.cos(ph2), m2 * torch.sin(ph2)], dim=-1)
+
     return (px2, py2, s2, th2, f2, c2)
+
+
+class FaceFramer:
+    """Live face framing that reproduces Dataset Prep's crop exactly
+    (same Haar cascade, same 0.35 margin, same square-up), plus EMA
+    smoothing so the crop doesn't jitter frame to frame. Fixes the
+    train/live framing mismatch: Dataset Prep face-crops the training
+    frames, but a plain center crop feeds the live encoder a smaller,
+    wandering face -> off-manifold -> blurry average head. Observed
+    Jul 2026: recon quality jumps when the live face happens to be
+    framed like the training crops; this makes that the default."""
+
+    def __init__(self, margin=0.35, ema=0.30, every=2):
+        import cv2 as cv
+        cpath = os.path.join(cv.data.haarcascades,
+                             "haarcascade_frontalface_default.xml")
+        self.det = cv.CascadeClassifier(cpath)
+        if self.det.empty():
+            self.det = None
+        self.margin, self.ema, self.every = margin, ema, every
+        self.box = None          # smoothed (cx, cy, half)
+        self.f = 0
+
+    def crop(self, fr):
+        import cv2 as cv
+        H, W = fr.shape[:2]
+        if self.det is not None and self.f % self.every == 0:
+            g = cv.cvtColor(fr, cv.COLOR_BGR2GRAY)
+            det = self.det.detectMultiScale(g, 1.15, 5, minSize=(80, 80))
+            if len(det):
+                x, y, w, h = max(det, key=lambda b: b[2] * b[3])
+                m = self.margin * max(w, h)          # hair + chin margin
+                cx, cy = x + w / 2, y + h / 2
+                half = max(w, h) / 2 + m
+                if self.box is None:
+                    self.box = (cx, cy, half)
+                else:
+                    a = self.ema
+                    self.box = (a * cx + (1 - a) * self.box[0],
+                                a * cy + (1 - a) * self.box[1],
+                                a * half + (1 - a) * self.box[2])
+        self.f += 1
+        if self.box is None:                          # fallback: center square
+            s = min(H, W)
+            return fr[(H - s)//2:(H + s)//2, (W - s)//2:(W + s)//2]
+        cx, cy, half = self.box
+        s = int(half)
+        x0, x1 = int(max(cx - s, 0)), int(min(cx + s, W))
+        y0, y1 = int(max(cy - s, 0)), int(min(cy + s, H))
+        c = fr[y0:y1, x0:x1]
+        return c if c.size else fr[(H - min(H, W))//2:(H + min(H, W))//2,
+                                   (W - min(H, W))//2:(W + min(H, W))//2]
 
 
 def clone_params(P):
@@ -328,15 +412,6 @@ class ExtractWorker(QThread):
             cap = cv.VideoCapture(self.video)
             if not cap.isOpened():
                 self.failed.emit(f"could not open {self.video}"); return
-            # PHONE PORTRAIT TRAP: phones record sideways pixels plus a
-            # rotation metadata tag. Every video player obeys the tag, so the
-            # clip LOOKS upright — but cv2 hands you the raw sideways frames,
-            # and the face detector only knows upright faces. We read the tag
-            # and rotate deterministically ourselves (mapping verified
-            # pixel-identical to OpenCV's CAP_PROP_ORIENTATION_AUTO):
-            #   tag 90 -> ROTATE_90_CLOCKWISE, 180 -> 180, 270 -> CCW.
-            # If your build predates these props, nothing rotates — the
-            # preview will show it sideways; simplest fix: record LANDSCAPE.
             rot_op, meta = None, 0
             try:
                 cap.set(cv.CAP_PROP_ORIENTATION_AUTO, 0)  # raw; we rotate
@@ -710,15 +785,12 @@ class TrainTab(QWidget):
         B, N = self.batch.value(), self.packets.value()
         chunk = 64
         lines = []
-        # dataset side
         d = self.data_dir.text().strip()
         exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp")
         n_img = sum(len(glob.glob(os.path.join(d, e))) for e in exts)
         cache_gb = n_img * 3 * S * S / 1e9
         lines.append(f"dataset: {n_img} images -> cache {cache_gb:.2f} GB "
                      f"(uint8 {S}px)")
-        # renderer working-set heuristic: per-chunk trig + envelope maps,
-        # fp32, x~6 intermediates. Heuristic, not a promise.
         work_gb = B * chunk * S * S * 4 * 6 / 1e9
         lines.append(f"renderer working set ~{work_gb:.2f} GB "
                      f"(batch {B} x chunk {chunk} @ {S}px, heuristic x6)")
@@ -885,10 +957,12 @@ class AvatarWorker(QThread):
         super().__init__()
         self.trainer_path, self.model_path = trainer_path, model_path
         self.source = source            # "webcam" | "walk"
-        self.mode = "phase"             # direct | lerp | phase | screw
+        self.mode = "phase"             # direct | lerp | phase | screw | dispersion
         self.kf = 8
         self.alpha = 0.35
         self.norm = True
+        self.align = True               # face-align live input to the
+                                        # Dataset Prep framing
         self.walk_step, self.z_max = 2.5, 12.0
         self._stop = False
 
@@ -913,7 +987,7 @@ class AvatarWorker(QThread):
         except Exception as e:
             self.status.emit(f"avatar failed: {type(e).__name__}: {e}")
 
-    # ---- webcam loop (wiring identical to avatar_driver.py live mode)
+    # ---- webcam loop
     def _webcam(self, model, ren, dev, torch):
         import cv2 as cv
         cap = cv.VideoCapture(0)
@@ -922,13 +996,18 @@ class AvatarWorker(QThread):
             return
         P = T = None
         f = 0
+        framer = FaceFramer() if self.align else None
         t_last, fps = time.time(), 0.0
         while not self._stop:
             ok, frame = cap.read()
             if not ok:
                 break
-            h, w = frame.shape[:2]; s = min(h, w)
-            crop = frame[(h - s) // 2:(h + s) // 2, (w - s) // 2:(w + s) // 2]
+            if framer is not None:
+                crop = framer.crop(frame)
+            else:
+                h, w = frame.shape[:2]; s = min(h, w)
+                crop = frame[(h - s) // 2:(h + s) // 2,
+                             (w - s) // 2:(w + s) // 2]
             x = cv.resize(crop, (ren.H, ren.W))[:, :, ::-1].astype(
                 np.float32) / 255.0
             if self.norm:
@@ -958,7 +1037,7 @@ class AvatarWorker(QThread):
             f += 1
         cap.release()
 
-    # ---- latent walk (no camera)
+    # ---- latent walk
     def _walk(self, model, ren, dev, torch):
         LATENT = getattr(import_trainer(self.trainer_path), "LATENT", 128)
         g = torch.Generator().manual_seed(0)
@@ -1019,10 +1098,13 @@ class AvatarTab(QWidget):
 
         ctl = QGroupBox("Drive"); g = QGridLayout(ctl)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["phase pursuit (certified transport)",
-                                  "lerp pursuit (baseline)",
-                                  "direct (encode every frame)",
-                                  "screw pursuit (demo)"])
+        self.mode_combo.addItems([
+            "phase pursuit (certified transport)",
+            "lerp pursuit (baseline)",
+            "direct (encode every frame)",
+            "screw pursuit (demo)",
+            "dispersion pursuit (closed-form phase advance)"
+        ])
         self.mode_combo.currentIndexChanged.connect(self.push_params)
         g.addWidget(QLabel("mode"), 0, 0); g.addWidget(self.mode_combo, 0, 1)
         self.kf_sl = QSlider(Qt.Orientation.Horizontal)
@@ -1044,6 +1126,12 @@ class AvatarTab(QWidget):
         self.norm_chk.setChecked(True)
         self.norm_chk.toggled.connect(self.push_params)
         g.addWidget(self.norm_chk, 3, 0, 1, 3)
+        self.align_chk = QCheckBox("face-align input (crop live face the "
+                                   "same way Dataset Prep cropped the "
+                                   "training frames)")
+        self.align_chk.setChecked(True)
+        self.align_chk.toggled.connect(self.push_params)
+        g.addWidget(self.align_chk, 4, 0, 1, 3)
         hb = QHBoxLayout()
         self.cam_btn = QPushButton("Start webcam"); self.cam_btn.setObjectName("accent")
         self.cam_btn.clicked.connect(lambda: self.start("webcam"))
@@ -1053,7 +1141,7 @@ class AvatarTab(QWidget):
         self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop)
         hb.addWidget(self.cam_btn); hb.addWidget(self.walk_btn)
         hb.addWidget(self.stop_btn); hb.addStretch(1)
-        g.addLayout(hb, 4, 0, 1, 3)
+        g.addLayout(hb, 5, 0, 1, 3)
         lay.addWidget(ctl)
         self.status = QLabel("load a model, then Start"); self.status.setObjectName("stat")
         lay.addWidget(self.status)
@@ -1082,14 +1170,8 @@ class AvatarTab(QWidget):
 
     def _mode(self):
         idx = self.mode_combo.currentIndex()
-        if idx == 0:
-            return "phase"
-        elif idx == 1:
-            return "lerp"
-        elif idx == 2:
-            return "direct"
-        else:  # idx == 3
-            return "screw"
+        modes = ["phase", "lerp", "direct", "screw", "dispersion"]
+        return modes[idx] if idx < len(modes) else "phase"
 
     def push_params(self):
         if self.worker:
@@ -1097,6 +1179,7 @@ class AvatarTab(QWidget):
             self.worker.kf = self.kf_sl.value()
             self.worker.alpha = self.al_sl.value() / 100
             self.worker.norm = self.norm_chk.isChecked()
+            self.worker.align = self.align_chk.isChecked()
 
     def start(self, source):
         mp = self.model_combo.currentData()
